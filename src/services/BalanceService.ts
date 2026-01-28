@@ -29,10 +29,11 @@ export class BalanceService {
                     );
                     if (coinResource) walletBal = BigInt((coinResource.data as any).coin.value);
                 } else {
+                    // FA tokens use primary_fungible_store
                     const result = await this.client.view({
                         payload: {
                             function: '0x1::primary_fungible_store::balance',
-                            typeArguments: [],
+                            typeArguments: ['0x1::fungible_asset::Metadata'],
                             functionArguments: [address, token.type]
                         }
                     });

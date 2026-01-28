@@ -3,6 +3,7 @@ import { CONFIG, TOKENS } from '../config';
 import { PrivyService } from './PrivyService';
 import { PythService } from './PythService';
 import { Aptos, AptosConfig, Network, Ed25519Signature, AccountAuthenticatorEd25519, Ed25519PublicKey } from "@aptos-labs/ts-sdk";
+import { serializeIntent, hashIntent } from '../utils/bcs';
 
 const INTENT_SWAP_ADDRESS = "0xbd128d4f1dbb87783658bed4a4046f3811015952110f321863c34f161eb07611";
 
@@ -244,6 +245,76 @@ export class SwapService {
         }
     }
 
+    /**
+     * Cancel all pending orders by incrementing on-chain nonce
+     */
+    async cancelOrders(telegramId: string): Promise<{ success: boolean; message: string; txHash?: string }> {
+        try {
+            const userData = await this.privyService.getOrCreateUser(telegramId);
+            const wallet = userData.wallet as any;
+
+            if (!wallet.id) {
+                throw new Error("No server wallet found. Please run /deposit first.");
+            }
+
+            const walletId = wallet.id;
+            const address = wallet.address;
+
+            console.log(`🚫 Cancelling orders for ${address}...`);
+
+            // Build cancel_orders transaction
+            const transaction = await this.client.transaction.build.simple({
+                sender: address,
+                data: {
+                    function: `${INTENT_SWAP_ADDRESS}::swap::cancel_orders`,
+                    typeArguments: [],
+                    functionArguments: [INTENT_SWAP_ADDRESS]
+                }
+            });
+
+            // Sign with Privy
+            const signingMessage = this.client.transaction.getSigningMessage({ transaction });
+            const signingHash = '0x' + Buffer.from(signingMessage).toString('hex');
+            const signatureHex = await this.privyService.signTransaction(walletId, signingHash);
+            if (!signatureHex) throw new Error("Failed to sign transaction");
+
+            // Get and normalize public key
+            const walletInfo = await (this.privyService as any).privy.wallets().get(walletId);
+            let publicKeyHex = walletInfo.public_key;
+            let cleanPubKey = publicKeyHex.startsWith('0x') ? publicKeyHex.slice(2) : publicKeyHex;
+            let pubKeyBuf = Buffer.from(cleanPubKey, 'hex');
+            if (pubKeyBuf.length === 33) pubKeyBuf = pubKeyBuf.subarray(1);
+
+            // Construct Authenticator
+            const cleanSig = signatureHex.startsWith('0x') ? signatureHex.slice(2) : signatureHex;
+            const signature = new Ed25519Signature(Buffer.from(cleanSig, 'hex'));
+            const publicKey = new Ed25519PublicKey(pubKeyBuf);
+            const authenticator = new AccountAuthenticatorEd25519(publicKey, signature);
+
+            // Submit
+            const pendingTx = await this.client.transaction.submit.simple({
+                transaction,
+                senderAuthenticator: authenticator
+            });
+
+            console.log(`🚫 Cancel submitted: ${pendingTx.hash}`);
+            await this.client.waitForTransaction({ transactionHash: pendingTx.hash });
+
+            return {
+                success: true,
+                message: `Orders cancelled! Your nonce has been incremented.`,
+                txHash: pendingTx.hash
+            };
+
+        } catch (e: any) {
+            console.error("Cancel Orders Error:", e);
+            return {
+                success: false,
+                message: `Cancel failed: ${e.message}`
+            };
+        }
+    }
+
     async executeSwap(telegramId: string, quote: SwapQuote): Promise<{ success: boolean; message: string; txHash?: string }> {
         try {
             // 1. Get user's SERVER wallet ID for signing
@@ -346,34 +417,62 @@ export class SwapService {
                 end_buy_amount: Math.floor(buyAmountAtomic * 0.95).toString()
             };
 
-            // 7. Hash and Sign Intent
-            const messageToSign = JSON.stringify(intent);
-            const encoder = new TextEncoder();
-            const dataHash = await crypto.subtle.digest('SHA-256', encoder.encode(messageToSign));
-            const messageHash = '0x' + Array.from(new Uint8Array(dataHash)).map(b => b.toString(16).padStart(2, '0')).join('');
+            // 7. Hash and Sign Intent (Corrected to use BCS + SHA3-256 for intent hash)
+            const serializedIntent = serializeIntent(
+                address,
+                nonce,
+                cleanSellType,
+                cleanBuyType,
+                sellAmountAtomic,
+                buyAmountAtomic,
+                Math.floor(buyAmountAtomic * 0.95), // endBuyAmount
+                now,
+                now + 300 // endTime
+            );
+
+            const intentHash = hashIntent(serializedIntent); // hex string without 0x
+            const intentHashHex = '0x' + intentHash;
 
             console.log(`Signing intent with Nonce ${nonce}...`);
-            const signature = await this.privyService.signMessage(walletId, messageHash);
+            console.log(`Intent Hash: ${intentHashHex}`);
+
+            // Construct AIP-62 Full Message for signing
+            // Format: "APTOS\nmessage: <intent_hash_hex>\nnonce: <nonce>"
+            const fullMessage = `APTOS\nmessage: ${intentHash}\nnonce: ${nonce}`;
+            console.log(`Full Message to Sign:\n${fullMessage}`);
+
+            // Convert to bytes and SHA-256 hash for rawSign
+            const { createHash } = await import('crypto');
+            const fullMessageBytes = Buffer.from(fullMessage, 'utf-8');
+            const fullMessageHash = createHash('sha256').update(fullMessageBytes).digest('hex');
+            const messageHashForSigning = '0x' + fullMessageHash;
+
+            console.log(`Full Message Hash (for rawSign): ${messageHashForSigning}`);
+
+            const signature = await this.privyService.signMessage(walletId, messageHashForSigning);
 
             // 8. Get public key for relayer
             const walletInfo = await (this.privyService as any).privy.wallets().get(walletId);
             const publicKey = walletInfo.public_key;
 
             // 9. Submit to Relayer
+            // Pass signingNonce as hex-encoded bytes matching on-chain format
+            const signingNonceHex = '0x' + Buffer.from(nonce, 'utf-8').toString('hex');
+            console.log(`Signing Nonce (hex): ${signingNonceHex}`);
             console.log("Submitting to relayer...");
             try {
                 const response = await axios.post(`${CONFIG.RELAYER_API_URL}/intents`, {
                     intent,
                     signature,
                     publicKey,
-                    signingNonce: nonce,
-                    intentHash: messageHash
+                    signingNonce: signingNonceHex,
+                    intentHash: intentHashHex
                 });
 
                 return {
                     success: true,
-                    message: `Order submitted! ID: ${response.data.orderId?.slice(0, 8) || 'pending'}`,
-                    txHash: response.data.orderId
+                    message: `Order submitted!`,
+                    txHash: intentHashHex  // Use intent hash as the unique order ID
                 };
             } catch (e: any) {
                 if (e.response?.data?.error) {
@@ -395,7 +494,7 @@ export class SwapService {
         return `📊 *Swap Quote*\n\n` +
             `📉 *Sell*: ${quote.sellAmount.toFixed(4)} ${quote.sellToken.symbol}\n` +
             `📈 *Buy*: ~${quote.buyAmount.toFixed(4)} ${quote.buyToken.symbol}\n` +
-            `💱 *Rate*: 1 ${quote.sellToken.symbol} = ${(1 / quote.rate).toFixed(6)} ${quote.buyToken.symbol}\n\n` +
+            `💱 *Rate*: 1 ${quote.sellToken.symbol} = ${quote.rate.toFixed(6)} ${quote.buyToken.symbol}\n\n` +
             `⚠️ Final amount may vary based on market conditions.\n` +
             `Reply with /confirm to execute this swap.`;
     }

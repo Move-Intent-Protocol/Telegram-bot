@@ -4,6 +4,7 @@ import { ActivityMonitor } from '../services/ActivityMonitor';
 import { PrivyService } from '../services/PrivyService';
 import { BalanceService } from '../services/BalanceService';
 import { SwapService, SwapQuote } from '../services/SwapService';
+import { OrderService } from '../services/OrderService';
 import { TOKENS } from '../config';
 
 // Store pending quotes per user
@@ -16,6 +17,7 @@ export class BotCommands {
     private privyService: PrivyService;
     private balanceService: BalanceService;
     private swapService: SwapService;
+    private orderService: OrderService;
 
     constructor(bot: Telegraf, priceService: PriceService, activityMonitor: ActivityMonitor, privyService: PrivyService) {
         this.bot = bot;
@@ -24,6 +26,7 @@ export class BotCommands {
         this.privyService = privyService;
         this.balanceService = new BalanceService();
         this.swapService = new SwapService(privyService);
+        this.orderService = new OrderService();
     }
 
     register() {
@@ -45,6 +48,8 @@ export class BotCommands {
         this.bot.command('swap', (ctx) => this.handleSwap(ctx));
         this.bot.command('confirm', (ctx) => this.handleConfirm(ctx));
         this.bot.command('withdraw', (ctx) => this.handleWithdraw(ctx));
+        this.bot.command('orders', (ctx) => this.handleOrders(ctx));
+        this.bot.command('cancel', (ctx) => this.handleCancel(ctx));
     }
 
     private async handleWithdraw(ctx: Context) {
@@ -101,7 +106,9 @@ export class BotCommands {
             `/balance - Check your balances\n\n` +
             `*💱 Trading Commands:*\n` +
             `/swap <sell> <buy> <amount> - Get a swap quote\n` +
-            `/confirm - Execute pending swap\n\n` +
+            `/confirm - Execute pending swap\n` +
+            `/orders - View your order history\n` +
+            `/cancel - Cancel pending orders\n\n` +
             `*📊 Market Commands:*\n` +
             `/prices - View all token prices\n` +
             `/swaps - View recent swaps\n` +
@@ -283,7 +290,7 @@ export class BotCommands {
     }
 
     private async handleConfirm(ctx: Context) {
-        if (!ctx.from) return;
+        if (!ctx.from || !ctx.chat) return;
 
         const quote = pendingQuotes.get(ctx.from.id.toString());
 
@@ -301,13 +308,60 @@ export class BotCommands {
             pendingQuotes.delete(ctx.from.id.toString());
 
             if (result.success) {
+                const orderHash = result.txHash || 'N/A';
+
                 await ctx.reply(
-                    `✅ *Swap Submitted!*\n\n` +
-                    `${result.message}\n\n` +
-                    `Your order will be filled when market conditions are met.\n` +
-                    `Use /balance to check your updated balances.`,
+                    `✅ *Order Submitted!*\n\n` +
+                    `📋 Order ID:\n\`${orderHash}\`\n\n` +
+                    `💱 ${quote.sellAmount.toFixed(4)} ${quote.sellToken.symbol} → ${quote.buyToken.symbol}\n\n` +
+                    `⏳ Waiting for fill...\n` +
+                    `Use /orders to check status or /cancel to cancel.`,
                     { parse_mode: 'Markdown' }
                 );
+
+                // Start background polling for order completion
+                const userData = await this.privyService.getOrCreateUser(ctx.from.id.toString());
+                const wallet = userData.wallet as any;
+                const chatId = ctx.chat.id;
+                const bot = this.bot;
+                const orderService = this.orderService;
+
+                // Non-blocking poll for completion
+                (async () => {
+                    const intentHash = result.txHash || '';
+                    const pollResult = await orderService.waitForOrderCompletion(
+                        intentHash,
+                        wallet.address,
+                        60000,  // 60 second timeout
+                        5000    // 5 second poll interval
+                    );
+
+                    try {
+                        if (pollResult.filled) {
+                            const txLink = pollResult.txHash ?
+                                `[View on Explorer](https://explorer.movementnetwork.xyz/txn/${pollResult.txHash}?network=testnet)` : '';
+
+                            await bot.telegram.sendMessage(chatId,
+                                `✅ *Order Filled!*\n\n` +
+                                `Your swap has been completed.\n` +
+                                `📉 Sold: ${quote.sellAmount.toFixed(4)} ${quote.sellToken.symbol}\n` +
+                                `📈 Received: ~${quote.buyAmount.toFixed(4)} ${quote.buyToken.symbol}\n\n` +
+                                `${txLink}\n` +
+                                `Use /balance to see your updated balances.`,
+                                { parse_mode: 'Markdown', link_preview_options: { is_disabled: true } }
+                            );
+                        } else if (pollResult.error && pollResult.error !== "Timeout waiting for order completion") {
+                            await bot.telegram.sendMessage(chatId,
+                                `❌ *Order Failed*\n\n${pollResult.error}\n\nUse /orders to see order history.`,
+                                { parse_mode: 'Markdown' }
+                            );
+                        }
+                        // On timeout, we don't send anything - user can check /orders
+                    } catch (notifyError) {
+                        console.error("Failed to send order notification:", notifyError);
+                    }
+                })();
+
             } else {
                 await ctx.reply(`❌ Swap failed: ${result.message}`);
             }
@@ -315,6 +369,79 @@ export class BotCommands {
         } catch (error: any) {
             console.error("Confirm Error:", error);
             await ctx.reply(`❌ Failed to execute swap: ${error.message || 'Unknown error'}`);
+        }
+    }
+
+    private async handleOrders(ctx: Context) {
+        if (!ctx.from) return;
+
+        await ctx.reply("⏳ Fetching your orders...");
+
+        try {
+            const user = await this.privyService.getOrCreateUser(ctx.from.id.toString(), ctx.from.username);
+            const wallet = user.wallet as any;
+
+            const orders = await this.orderService.getOrders(wallet.address);
+            const message = this.orderService.formatOrdersMessage(orders);
+
+            await ctx.reply(message, { parse_mode: 'Markdown', link_preview_options: { is_disabled: true } });
+
+        } catch (error: any) {
+            console.error("Orders Error:", error);
+            await ctx.reply(`❌ Failed to fetch orders: ${error.message || 'Unknown error'}`);
+        }
+    }
+
+    private async handleCancel(ctx: Context) {
+        if (!ctx.from) return;
+
+        await ctx.reply("⏳ Checking your orders...");
+
+        try {
+            // First check if there are any pending orders
+            const userData = await this.privyService.getOrCreateUser(ctx.from.id.toString(), ctx.from.username);
+            const wallet = userData.wallet as any;
+            const orders = await this.orderService.getOrders(wallet.address);
+            const pendingOrders = orders.filter(o => o.status === 'PENDING');
+
+            if (pendingOrders.length === 0) {
+                // Show order history if no pending orders
+                const filledOrders = orders.filter(o => o.status === 'FILLED');
+                if (filledOrders.length > 0) {
+                    await ctx.reply(
+                        `✅ *No pending orders to cancel*\n\n` +
+                        `Your last order was already filled!\n` +
+                        `Use /orders to see your order history.`,
+                        { parse_mode: 'Markdown' }
+                    );
+                } else {
+                    await ctx.reply(
+                        `ℹ️ *No pending orders*\n\n` +
+                        `You don't have any orders to cancel.\n` +
+                        `Use /swap to create a new order.`,
+                        { parse_mode: 'Markdown' }
+                    );
+                }
+                return;
+            }
+
+            // Proceed with cancellation
+            const result = await this.swapService.cancelOrders(ctx.from.id.toString());
+
+            if (result.success) {
+                await ctx.reply(
+                    `✅ *Orders Cancelled*\n\n` +
+                    `${result.message}\n\n` +
+                    `${pendingOrders.length} pending order(s) have been invalidated.`,
+                    { parse_mode: 'Markdown' }
+                );
+            } else {
+                await ctx.reply(`❌ Cancel failed: ${result.message}`);
+            }
+
+        } catch (error: any) {
+            console.error("Cancel Error:", error);
+            await ctx.reply(`❌ Failed to cancel orders: ${error.message || 'Unknown error'}`);
         }
     }
 
