@@ -5,6 +5,7 @@ import { PrivyService } from '../services/PrivyService';
 import { BalanceService } from '../services/BalanceService';
 import { SwapService, SwapQuote } from '../services/SwapService';
 import { OrderService } from '../services/OrderService';
+import { FaucetService } from '../services/FaucetService';
 import { TOKENS } from '../config';
 
 // Store pending quotes per user
@@ -18,6 +19,7 @@ export class BotCommands {
     private balanceService: BalanceService;
     private swapService: SwapService;
     private orderService: OrderService;
+    private faucetService: FaucetService;
 
     constructor(bot: Telegraf, priceService: PriceService, activityMonitor: ActivityMonitor, privyService: PrivyService) {
         this.bot = bot;
@@ -27,6 +29,7 @@ export class BotCommands {
         this.balanceService = new BalanceService();
         this.swapService = new SwapService(privyService);
         this.orderService = new OrderService();
+        this.faucetService = new FaucetService();
     }
 
     register() {
@@ -43,6 +46,7 @@ export class BotCommands {
         this.bot.command('deposit', (ctx) => this.handleDeposit(ctx));
         this.bot.command('balance', (ctx) => this.handleBalance(ctx));
         this.bot.command('reset_wallet', (ctx) => this.handleResetWallet(ctx));
+        this.bot.command('faucet', (ctx) => this.handleFaucet(ctx));
 
         // Trading Commands
         this.bot.command('swap', (ctx) => this.handleSwap(ctx));
@@ -102,6 +106,7 @@ export class BotCommands {
             `Trade tokens on Movement Network directly from Telegram!\n\n` +
             `*💼 Wallet Commands:*\n` +
             `/deposit - Get your wallet address\n` +
+            `/faucet - Claim free test MOVE\n` +
             `/withdraw <token> <amount> - Withdraw from escrow\n` +
             `/balance - Check your balances\n\n` +
             `*💱 Trading Commands:*\n` +
@@ -464,6 +469,48 @@ export class BotCommands {
         } catch (error: any) {
             console.error("Reset Wallet Error:", error);
             await ctx.reply(`❌ Failed to reset wallet: ${error.message || 'Unknown error'}`);
+        }
+    }
+
+    private async handleFaucet(ctx: Context) {
+        if (!ctx.from) return;
+
+        await ctx.reply("💧 Checking faucet...");
+
+        try {
+            // Get or create user wallet
+            const user = await this.privyService.getOrCreateUser(ctx.from.id.toString(), ctx.from.username);
+            const wallet = user.wallet as any;
+
+            if (!wallet.address) {
+                await ctx.reply(
+                    `❌ No wallet found. Please use /deposit first to create your wallet.`,
+                    { parse_mode: 'Markdown' }
+                );
+                return;
+            }
+
+            // Request tokens from faucet
+            const result = await this.faucetService.claimTokens(wallet.address, ctx.from.id.toString());
+
+            if (result.success) {
+                const txLink = result.txHash ?
+                    `[View TX](https://explorer.movementnetwork.xyz/txn/${result.txHash}?network=testnet)` : '';
+
+                await ctx.reply(
+                    `💧 *Faucet Claim Successful!*\n\n` +
+                    `${result.message}\n\n` +
+                    `${txLink}\n` +
+                    `Use /balance to see your updated balance.`,
+                    { parse_mode: 'Markdown', link_preview_options: { is_disabled: true } }
+                );
+            } else {
+                await ctx.reply(`❌ ${result.message}`);
+            }
+
+        } catch (error: any) {
+            console.error("Faucet Error:", error);
+            await ctx.reply(`❌ Failed to claim: ${error.message || 'Unknown error'}`);
         }
     }
 }
